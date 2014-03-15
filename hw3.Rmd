@@ -1,0 +1,101 @@
+BIOST 578 HW 3
+========================================================
+ 
+```{r, message=FALSE, echo=FALSE}
+## load libraries
+library(GEOquery)
+library(limma)
+library(pheatmap)
+library(GSEABase)
+```
+
+## Get data from GEO 
+
+```{r}
+#gd <- getGEO("GSE45735", destdir = "./Data/")
+gd <- getGEO(filename = "./Data/GSE45735_series_matrix.txt")  
+pd <- pData(gd)
+
+## the T14 file is problematic and needs to be fixed by hand
+#getGEOSuppFiles("GSE45735", makeDirectory=FALSE, baseDir = "./Data/")  ## need to manually unzip .gz file first before proceeding
+
+## note the regular expression to grep file names
+files <- list.files(path = "./Data/", pattern = "GSE45735_T.*.txt", full.names = TRUE) 
+file_list <- lapply(files, read.table, header=TRUE)
+
+## remove duplicated rows
+file_list_unique <- lapply(file_list, function(x){x<-x[!duplicated(x$Gene),]; 
+                                                  x <- x[order(x$Gene),]; 
+                                                  rownames(x) <- x$Gene;
+                                                  x[,-1]})
+
+## take the intersection of all genes
+gene_list <- Reduce(intersect, lapply(file_list_unique, rownames))
+file_list_unique <- lapply(file_list_unique, "[", gene_list,)
+matrix <- as.matrix(do.call(cbind, file_list_unique))
+
+## clean up the pData
+pd_small <- pd[!grepl("T13_Day8",pd$title),]
+pd_small$Day <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title),"_"),"[",2)
+pd_small$subject <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title),"_"),"[",1)
+colnames(matrix) <- rownames(pd_small)
+```
+
+## Use voom and limma to find genes differentially expressed at each time point compared to baseline (day 0). Use an FDR cutoff of 0.01. Display your results using pheatmap showing the log fold-change of differentially expressed genes grouped by time point.
+
+```{r}
+## add one to count
+new_set <- ExpressionSet(assayData = matrix+1)
+pData(new_set) <- pd_small
+
+## voom + limma
+design <- model.matrix(~subject+Day, new_set)
+new_set_voom <- voom(new_set, design = design)
+lm <- lmFit(new_set_voom, design)
+eb <- eBayes(lm)
+
+## get adjusted P value for each coefficient associated with Day for each probe
+res.genes <- vector("list", length = 10)
+for(i in 1:10) {
+  coef <- paste0("DayDay", i)
+  res.genes[[i]] <- topTable(eb, coef = coef, number=Inf)
+}
+
+## visualize results
+PValue <- sapply(res.genes, function(x){x$adj.P.Val})
+LogFC <- sapply(res.genes, function(x){x$logFC})
+rownames(LogFC) <- rownames(res.genes[[1]])
+PValue_min <- rowMin(PValue)
+LogFC_small <- LogFC[PValue_min<0.01, ]  # FDR cutoff of 0.01
+anno <- data.frame(Time=paste0("Day", 1:10))
+rownames(anno) <- colnames(LogFC_small) <- paste0("Day", 1:10)
+pheatmap(LogFC_small, cluster_cols=FALSE)
+```
+
+
+## Perform a GSEA analysis using camera and the MSigDB Reactome pathway gene signatures. Display your results using pheatmap, again group by timepoint.
+
+```{r}
+## convert gene sets to gene indices
+c2_set <- getGmt("./Data/c2.all.v4.0.symbols.gmt")
+gene_ids <- geneIds(c2_set)
+sets_indices <- symbols2indices(gene_ids, rownames(new_set))
+
+## find enriched gene sets over time
+res.gsea <- vector("list",length = 10)
+for(i in 1:10)
+  {
+  contrast <- paste0("DayDay", i)
+  cont_matrix <- makeContrasts(contrast, levels=design)
+  res.gsea[[i]] <- camera(new_set_voom, sets_indices, design=design, contrast=cont_matrix, sort=FALSE)
+}
+
+## visualize results
+PValueGSEA <- sapply(res.gsea, function(x){ifelse(x$Direction=="Up", -10*log10(x$PValue), 10*log10(x$PValue))})
+rownames(PValueGSEA) <- rownames(res.gsea[[1]])
+PValueGSEA_max <- rowMax(abs(PValueGSEA))
+PValueGSEA_small <- PValueGSEA[PValueGSEA_max>30, ]
+anno <- data.frame(Time=paste0("Day",1:10))
+rownames(anno) <- colnames(PValueGSEA_small)  <- paste0("Day",1:10)
+pheatmap(PValueGSEA_small, cluster_cols=FALSE)
+```
